@@ -1,5 +1,3 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as cp from 'child_process';
 import * as vscode from 'vscode';
 
@@ -8,6 +6,7 @@ export class FreeCodingChannel {
 	private _questionsListener: Callback | null;
 	private _answerListener: Callback | null;
 	private _buffer: string[] = [];
+	private _defaultLanguage: string = 'pt-br';
 
 	constructor() {
 		this._questionsListener = null;
@@ -20,6 +19,14 @@ export class FreeCodingChannel {
 		} else {
 			this._buffer.push(content);
 		}
+	}
+
+	changeLanguage(lang: string) {
+		this._defaultLanguage = lang;
+	}
+
+	defaultLanguage(): string {
+		return this._defaultLanguage;
 	}
 
 	answer(content: string) {
@@ -44,6 +51,11 @@ export class FreeCodingChannel {
 			this._buffer = []; // Clear the buffer
 		}
 	}
+}
+
+interface FrontendMessage {
+	type: string;
+	data: string;
 }
 
 export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
@@ -76,20 +88,29 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private _handleMessage(message: string) {
+	private _handleMessage(content: string) {
 		if (!this._view) {
 			return;
 		}
 		const webView = this._view.webview;
-		this._channel.listenAnswers(answer => webView.postMessage({
-			type: 'addMessage',
-			value: {
-				text: answer,
-				isUser: false,
-				timestamp: new Date().toLocaleTimeString()
+		let message = JSON.parse(content) as FrontendMessage;
+		switch (message.type) {
+			case "sendMessage": {
+				this._channel.listenAnswers(answer => webView.postMessage({
+					type: 'addMessage',
+					value: {
+						text: answer,
+						isUser: false,
+						timestamp: new Date().toLocaleTimeString()
+					}
+				}));
+				this._channel.ask(message.data);
+			};
+			case "changeLanguage": {
+				console.log("Free Coding change language event!", message);
+				this._channel.changeLanguage(message.data);
 			}
-		}));
-		this._channel.ask(message);
+		}
 	}
 
 	private _getHtmlForWebview(webview: vscode.Webview) {
@@ -112,6 +133,12 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
                   <input id="messageInput" type="text" placeholder="Type a message...">
                   <button id="sendButton">Send</button>
               </div>
+			  <div class="language-selector">
+			  	<select id="languageSelector">
+					<option value="pt-br" selected>Português (Brasil)</option>
+					<option value="en">English</option>
+				</select>
+			  </div>
           </div>
           <script src="${scriptUri}"></script>
       </body>
@@ -136,9 +163,12 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 
 	channel.listenQuestions((content) => {
 		console.log("[Free Coding] Sending question to backend...", content);
-		javaProcess.stdin.write("FREECODING START\n");
+		javaProcess.stdin.write("SELECT_LANGUAGE START\n");
+		javaProcess.stdin.write(channel.defaultLanguage());
+		javaProcess.stdin.write("\nSELECT_LANGUAGE END\n");
+		javaProcess.stdin.write("FREECODING_QUESTION START\n");
 		javaProcess.stdin.write(content);
-		javaProcess.stdin.write("\nFREECODING END\n");
+		javaProcess.stdin.write("\nFREECODING_QUESTION END\n");
 	});
 
 	let buffer = '';
@@ -150,7 +180,7 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 		var content = enc.decode(data);
 		console.log("[Free Coding] Raw answer received from backend...", content);
 
-		buffer += content;	
+		buffer += content;
 
 		// Process the buffer to find answers
 		while (true) {

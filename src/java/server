@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.CountDownLatch;
 import java.util.Scanner;
+import java.util.Map;
 import java.util.stream.*;
 
 import org.slf4j.Logger;
@@ -24,6 +25,24 @@ public class server {
     private static final Logger logger = LoggerFactory.getLogger(server.class);
     private static final int BUFFER_SIZE = 1024;
     private static final String DELIMITER = "\n";
+    private static final String OPERATION_PATTERN = "^(\\w+) (START|END)$";
+    private static String language = "pt-br";
+    private static final Map<String, String> PROMPTS = Map.of("en",  """
+                                                                     Here is my project code:
+                                                                     ```
+                                                                     %s
+                                                                     ```
+                                                                     I'm am a Software Engineer that will make questions about this code.
+                                                                     Please, answer the following questions: %s
+                                                                     """, 
+                                                              "pt-br", """
+                                                                       Este é o código fonte do projeto:
+                                                                       ```
+                                                                       %s
+                                                                       ```
+                                                                       Eu sou um Engenheiro de Software que fará pergutnas sobre este código.
+                                                                       Por favor, responda as seguintes perguntas: %s
+                                                                       """);
 
     public static void main(String... args) {
         try {
@@ -47,14 +66,16 @@ public class server {
             var model = OllamaChatModel.builder()
                                        .baseUrl("http://localhost:11434")
                                        .modelName("deepseek-coder")
-                                       .timeout(Duration.ofMinutes(5)) // Increased timeout
+                                       .timeout(Duration.ofMinutes(5))
                                        .build();
 
             // Set up non-blocking input channel
             var channel = Channels.newChannel(System.in);
             var buffer = ByteBuffer.allocate(BUFFER_SIZE);
             var inputBuffer = new StringBuilder();
-            var content = new StringBuilder();
+            var currentOperation = new StringBuilder();
+            String activeOperation = null;
+            
             logger.info("Process started!!! Reading input channel...");
             while (running.get()) {
                 int bytesRead = channel.read(buffer);
@@ -71,21 +92,35 @@ public class server {
                     // Process complete lines
                     int delimiterPos;
                     while (running.get() && (delimiterPos = inputBuffer.indexOf(DELIMITER)) != -1) {
-                        String line = inputBuffer.substring(0, delimiterPos);
+                        String line = inputBuffer.substring(0, delimiterPos).trim();
                         inputBuffer.delete(0, delimiterPos + DELIMITER.length());
-                        
-                        if (line.equals("FREECODING START")) {
-                            content.setLength(0);
-                        } else if (line.equals("FREECODING END")) {
-                            var question = content.toString();
-                            logger.info("Question received! question={}", question);
-                            var answer = queryModel(model, question);
-                            logger.info("Answer produced! answer={}", answer);
-                            System.out.println("FREECODING_ANSWER START");
-                            System.out.println(answer);
-                            System.out.println("FREECODING_ANSWER END");
-                        } else {
-                            content.append(line).append("\n");
+                        logger.info("Processing line: {}", line);
+                        if (line.matches(OPERATION_PATTERN)) {
+                            String[] parts = line.split(" ");
+                            String operation = parts[0];
+                            String action = parts[1];
+                            
+                            if ("START".equals(action)) {
+                                if (activeOperation != null) {
+                                    logger.warn("Nested operations not supported. Already in operation: {}", activeOperation);
+                                } else {
+                                    activeOperation = operation;
+                                    currentOperation.setLength(0);
+                                    logger.info("Operation {} started", activeOperation);
+                                }
+                            } else if ("END".equals(action)) {
+                                if (activeOperation == null) {
+                                    logger.warn("END received without active operation");
+                                } else if (!activeOperation.equals(operation)) {
+                                    logger.warn("END operation mismatch. Expected: {}, got: {}", activeOperation, operation);
+                                } else {
+                                    logger.info("Operation {} ended", activeOperation);
+                                    handleOperation(activeOperation.trim(), currentOperation.toString().trim(), model);
+                                    activeOperation = null;
+                                }
+                            }
+                        } else if (activeOperation != null) {
+                            currentOperation.append(line).append("\n");
                         }
                     }
                 } else {
@@ -101,17 +136,30 @@ public class server {
         }
     }
     
-    private static String queryModel(OllamaChatModel model, String question) throws IOException {
-        var prompt = """
-            Here is my project code:
-            ```
-            %s
-            ```
-            I'm am a Software Engineer that will make questions about this code.
-            Please, answer the following questions: %s
-            """.formatted(loadProjectCode(), question);
+    private static void handleOperation(String operation, String content, OllamaChatModel model) throws IOException {
+        logger.info("Operation '{}'", operation);
+        switch (operation) {
+            case "FREECODING_QUESTION":
+                logger.info("Processing FREECODING operation");
+                String answer = queryModel(model, content);
+                System.out.println("FREECODING_ANSWER START");
+                System.out.println(answer);
+                System.out.println("FREECODING_ANSWER END");
+                break;
+            case "SELECT_LANGUAGE": 
+                logger.info("Changing language to '{}'", content);
+                language = content;
+                break;
+            default:
+                logger.warn("Unknown operation: {}", operation);
+                System.out.println(operation + "_ERROR START");
+                System.out.println("Unsupported operation: " + operation);
+                System.out.println(operation + "_ERROR END");
+        }
+    }
     
-        return  model.chat(prompt);
+    private static String queryModel(OllamaChatModel model, String question) throws IOException {
+        return model.chat(PROMPTS.get(language).formatted(loadProjectCode(), question));
     }
 
     private static String loadProjectCode() throws IOException {

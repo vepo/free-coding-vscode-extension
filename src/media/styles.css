@@ -77,3 +77,16 @@ button {
 button:hover {
   background-color: var(--vscode-button-hoverBackground);
 }
+
+.language-selector{
+  margin-top: 0.5rem;
+  
+}
+
+.language-selector select {
+  width: 100%;
+  background-color: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  padding: 8px;
+  border: 1px solid var(--vscode-input-border);
+}
