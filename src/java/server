@@ -44,6 +44,11 @@ public class server {
                         }
                     }
                 });
+            var model = OllamaChatModel.builder()
+                                       .baseUrl("http://localhost:11434")
+                                       .modelName("deepseek-coder")
+                                       .timeout(Duration.ofMinutes(5)) // Increased timeout
+                                       .build();
 
             // Set up non-blocking input channel
             var channel = Channels.newChannel(System.in);
@@ -74,8 +79,10 @@ public class server {
                         } else if (line.equals("FREECODING END")) {
                             var question = content.toString();
                             logger.info("Question received! question={}", question);
+                            var answer = queryModel(model, question);
+                            logger.info("Answer produced! answer={}", answer);
                             System.out.println("FREECODING_ANSWER START");
-                            System.out.println(question);
+                            System.out.println(answer);
                             System.out.println("FREECODING_ANSWER END");
                         } else {
                             content.append(line).append("\n");
@@ -92,24 +99,19 @@ public class server {
         } catch (Exception ex) {
             logger.error("Error!", ex);
         }
-        // var model = OllamaChatModel.builder()
-        //                            .baseUrl("http://localhost:11434")
-        //                            .modelName("deepseek-coder")
-        //                            .timeout(Duration.ofMinutes(5)) // Increased timeout
-        //                            .build();
-
-        // String prompt = """
-        //     Here is my project code:
-        //     ```
-        //     %s
-        //     ```
-            
-        //     Based on this code, list important changes to make the code more readable and maintainable.
-        //     """.formatted(loadProjectCode());
-
-        // // 4. Get and print the answer
-        // String answer = model.chat(prompt);
-        // System.out.println(answer);
+    }
+    
+    private static String queryModel(OllamaChatModel model, String question) throws IOException {
+        var prompt = """
+            Here is my project code:
+            ```
+            %s
+            ```
+            I'm am a Software Engineer that will make questions about this code.
+            Please, answer the following questions: %s
+            """.formatted(loadProjectCode(), question);
+    
+        return  model.chat(prompt);
     }
 
     private static String loadProjectCode() throws IOException {

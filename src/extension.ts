@@ -1,34 +1,48 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
 import * as cp from 'child_process';
-import { channel } from 'diagnostics_channel';
+import * as vscode from 'vscode';
 
 export type Callback = (content: string) => void;
 export class FreeCodingChannel {
-	private _listener: Callback | null;
+	private _questionsListener: Callback | null;
+	private _answerListener: Callback | null;
 	private _buffer: string[] = [];
 
 	constructor() {
-		this._listener = null;
+		this._questionsListener = null;
+		this._answerListener = null;
 	}
+
 	ask(content: string) {
-		if (this._listener) {
-			this._listener(content);
+		if (this._questionsListener) {
+			this._questionsListener(content);
 		} else {
 			this._buffer.push(content);
 		}
 	}
-	listen(listener: Callback) {
-		this._listener = listener;
+
+	answer(content: string) {
+		if (this._answerListener) {
+			this._answerListener(content);
+		} else {
+			throw new Error("Invalid state!!! Answer Listener not found!");
+		}
+	}
+
+	listenAnswers(listener: Callback) {
+		this._answerListener = listener;
+	}
+
+	listenQuestions(listener: Callback) {
+		this._questionsListener = listener;
 		// Process any buffered messages
 		if (this._buffer.length > 0) {
 			for (const bufferedContent of this._buffer) {
-				this._listener(bufferedContent);
+				this._questionsListener(bufferedContent);
 			}
 			this._buffer = []; // Clear the buffer
 		}
-
 	}
 }
 
@@ -66,18 +80,16 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 		if (!this._view) {
 			return;
 		}
-
+		const webView = this._view.webview;
+		this._channel.listenAnswers(answer => webView.postMessage({
+			type: 'addMessage',
+			value: {
+				text: answer,
+				isUser: false,
+				timestamp: new Date().toLocaleTimeString()
+			}
+		}));
 		this._channel.ask(message);
-
-		// // Echo the message back for demonstration
-		// this._view.webview.postMessage({
-		// 	type: 'addMessage',
-		// 	value: {
-		// 		text: message,
-		// 		isUser: false,
-		// 		timestamp: new Date().toLocaleTimeString()
-		// 	}
-		// });
 	}
 
 	private _getHtmlForWebview(webview: vscode.Webview) {
@@ -122,16 +134,54 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 		stdio: ['pipe', 'pipe', 'pipe'] // stdin, stdout, stderr
 	});
 
-	channel.listen((content) => {
+	channel.listenQuestions((content) => {
+		console.log("[Free Coding] Sending question to backend...", content);
 		javaProcess.stdin.write("FREECODING START\n");
 		javaProcess.stdin.write(content);
 		javaProcess.stdin.write("\nFREECODING END\n");
 	});
 
+	let buffer = '';
+	let isCapturing = false;
+
 	// Handle process output
 	javaProcess.stdout?.on('data', (data) => {
-		console.log(`Java stdout: ${data}`);
-		vscode.window.showInformationMessage(`Java: ${data}`);
+		var enc = new TextDecoder("utf-8");
+		var content = enc.decode(data);
+		console.log("[Free Coding] Raw answer received from backend...", content);
+
+		buffer += content;	
+
+		// Process the buffer to find answers
+		while (true) {
+			if (!isCapturing) {
+				const startIdx = buffer.indexOf('FREECODING_ANSWER START');
+				if (startIdx === -1) {
+					// No start marker found, discard everything
+					buffer = '';
+					break;
+				}
+
+				// Found start marker, begin capturing
+				isCapturing = true;
+				buffer = buffer.slice(startIdx + 'FREECODING_ANSWER START'.length);
+			} else {
+				const endIdx = buffer.indexOf('FREECODING_ANSWER END');
+				if (endIdx === -1) {
+					// No end marker yet, wait for more data
+					break;
+				}
+
+				// Found end marker, extract answer and send it
+				const answer = buffer.slice(0, endIdx).trim();
+				console.log("[Free Coding] Filtered answer received from backend...", answer);
+				channel.answer(answer);
+
+				// Reset state and process remaining buffer
+				isCapturing = false;
+				buffer = buffer.slice(endIdx + 'FREECODING_ANSWER END'.length);
+			}
+		}
 	});
 
 	javaProcess.stderr?.on('data', (data) => {
@@ -142,6 +192,7 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 	// Handle process exit
 	javaProcess.on('close', (code) => {
 		console.log(`Java process exited with code ${code}`);
+		vscode.window.showErrorMessage(`Backend server died with code: ${code}`);
 	});
 
 	// Store the process reference for later management
@@ -155,7 +206,7 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 }
 
 export function activate(context: vscode.ExtensionContext) {
-	console.log("[Free Coding] Starting Free Coding...")
+	console.log("[Free Coding] Starting Free Coding...");
 	const channel = new FreeCodingChannel();
 	const provider = new FreeCodingChatViewProvider(context.extensionUri, channel);
 
