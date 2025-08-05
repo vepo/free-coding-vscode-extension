@@ -45,6 +45,15 @@ body {
   color: var(--vscode-input-foreground);
 }
 
+.backend-message {
+  align-self: stretch;
+  background-color: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  opacity: 0.8;
+  width: 100%;
+  font-style: italic;
+}
+
 .message-meta {
   font-size: 0.8em;
   opacity: 0.7;

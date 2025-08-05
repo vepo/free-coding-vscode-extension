@@ -1,85 +1,293 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
-//DEPS dev.langchain4j:langchain4j-ollama:1.2.0
-//DEPS ch.qos.logback:logback-classic:1.5.18
+
+//DEPS info.picocli:picocli:4.7.7
 //DEPS org.slf4j:slf4j-api:2.0.17
+//DEPS ch.qos.logback:logback-classic:1.5.18
+//DEPS dev.langchain4j:langchain4j:1.2.0
+//DEPS dev.langchain4j:langchain4j-ollama:1.2.0
+//DEPS dev.langchain4j:langchain4j-easy-rag:1.2.0-beta8
 
-import dev.langchain4j.model.ollama.OllamaChatModel;
+import static dev.langchain4j.data.document.loader.FileSystemDocumentLoader.loadDocuments;  
+import static dev.langchain4j.data.document.loader.FileSystemDocumentLoader.loadDocument;
+import static java.util.stream.Collectors.joining;
 
+
+import java.io.File;
 import java.io.IOException;
+
 import java.nio.ByteBuffer;
-import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.channels.Channels;
+
 import java.time.Duration;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.CountDownLatch;
-import java.util.Scanner;
+
+import java.util.concurrent.Callable;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Queue;
 import java.util.Map;
-import java.util.stream.*;
+
+import java.util.stream.Stream;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import java.nio.file.Paths;
 
-public class server {
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
+import picocli.CommandLine.ITypeConverter;
+import picocli.CommandLine.Parameters;
+
+import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.document.DocumentParser;
+import dev.langchain4j.data.document.DocumentSplitter;
+import dev.langchain4j.data.document.parser.TextDocumentParser;
+import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.exception.TimeoutException;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.input.Prompt;
+import dev.langchain4j.model.input.PromptTemplate;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+
+
+@Command(name = "freecoding-server", mixinStandardHelpOptions = true, version = "Free Coding Server 0.1",
+        description = "Develop using LLMs without using you credit card")
+public class server implements Callable<Integer> {
     private static final Logger logger = LoggerFactory.getLogger(server.class);
     private static final int BUFFER_SIZE = 1024;
     private static final String DELIMITER = "\n";
     private static final String OPERATION_PATTERN = "^(\\w+) (START|END)$";
-    private static String language = "pt-br";
-    private static final Map<String, String> PROMPTS = Map.of("en",  """
-                                                                     Here is my project code:
-                                                                     ```
-                                                                     %s
-                                                                     ```
-                                                                     I'm am a Software Engineer that will make questions about this code.
-                                                                     Please, answer the following questions: %s
-                                                                     """, 
+
+    private static final Map<String, String> PROMPTS = Map.of("en", """
+                                                                    Answer the following question, explaining your reasoning.
+                                                                    
+                                                                    Also, develop 3 to 5 follow-up questions
+                                                                    to this question.
+                                                                    
+                                                                    Question:
+                                                                    {{question}}
+                                                                    
+                                                                    Base your answer on the following information:
+                                                                    {{information}}
+                                                                    """,
                                                               "pt-br", """
-                                                                       Este é o código fonte do projeto:
-                                                                       ```
-                                                                       %s
-                                                                       ```
-                                                                       Eu sou um Engenheiro de Software que fará pergutnas sobre este código.
-                                                                       Por favor, responda as seguintes perguntas: %s
-                                                                       """);
+                                                                       Responda a pergunta a seguir, explicitando o embasameno da resposta. 
+                                                                       Também elabore de 3 a 5 perguntas que podem ser feitas em sequeência 
+                                                                       a essa pergunta.
+                                                                       
+                                                                       Pergunta:
+                                                                       {{question}}
+                                                                       
+                                                                       Baseie sua resposta na seguinte informação:
+                                                                       {{information}}
+                                                                       """,
+                                                              "es", """
+                                                                    Responda la siguiente pregunta, explicando su razonamiento.
+                                                                    
+                                                                    Además, desarrolle de 3 a 5 preguntas complementarias a esta pregunta.
+                                                                    
+                                                                    Pregunta:
+                                                                    {{pregunta}}
+                                                                    
+                                                                    Base su respuesta en la siguiente información:
+                                                                    {{información}}
+                                                                    """);
+
+    private static final Duration durationParser(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException("Duration string cannot be null or empty");
+        }
+
+        // Regular expression to match the pattern: one or more digits followed by S, M, or H
+        Pattern pattern = Pattern.compile("^(\\d+)([SMH])$", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(value.trim().toUpperCase());
+
+        if (!matcher.matches()) {
+            throw new IllegalArgumentException("Invalid duration format. Expected format like '5M', '1H', '30S'");
+        }
+
+        int numberValue = Integer.parseInt(matcher.group(1));
+        String unit = matcher.group(2);
+
+        switch (unit) {
+            case "S":
+                return Duration.ofSeconds(numberValue);
+            case "M":
+                return Duration.ofMinutes(numberValue);
+            case "H":
+                return Duration.ofHours(numberValue);
+            default:
+                // This shouldn't happen due to regex validation
+                throw new IllegalArgumentException("Invalid time unit. Use S, M, or H");
+        }
+    }
 
     public static void main(String... args) {
+        int exitCode = new CommandLine(new server()).registerConverter(Duration.class, server::durationParser).execute(args);
+        System.exit(exitCode);
+    }
+
+    @Option(names = {"--workspace", "-w"}, defaultValue = "", description = "Project Workspace. Current directory by default.")
+    private String workspace;
+
+    @Option(names = {"--model", "-m"}, defaultValue = "deepseek-coder", description = "Ollama Model. Default: ${DEFAULT-VALUE}")
+    private String model;
+
+    @Option(names={"--base-url", "-u"}, defaultValue = "http://localhost:11434", description = "Ollama base url. Default: ${DEFAULT-VALUE}")
+    private String baseUrl;
+
+    @Option(names={"--timeout", "-t"}, defaultValue = "15M", description = "Ollama timeout. Default: ${DEFAULT-VALUE}")
+    private Duration timeout;
+
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final CountDownLatch latch = new CountDownLatch(2);
+    private OllamaChatModel ollamaModel;
+    private OllamaEmbeddingModel embeddingModel;
+    private InMemoryEmbeddingStore<TextSegment> embeddingStore;
+    private DocumentParser documentParser;
+    private DocumentSplitter splitter;
+    private static String language = "pt-br";
+
+    private void loadModel() {
+        this.ollamaModel = OllamaChatModel.builder()
+                                        .baseUrl(this.baseUrl)
+                                        .modelName(this.model)
+                                        .timeout(this.timeout)
+                                        .build();
+        logger.info("Creating model and emdebbing store...");
+        this.embeddingModel = OllamaEmbeddingModel.builder()
+                                                .baseUrl(this.baseUrl)
+                                                .modelName(this.model)
+                                                .timeout(this.timeout)
+                                                .build();
+
+        Path workspaceData = getEmbeddingStorePath();
+        if (workspaceData.toFile().exists()) {
+            logger.info("Loading embeddings from file {}", workspaceData);
+            this.embeddingStore = InMemoryEmbeddingStore.fromFile(workspaceData);
+        } else {
+            this.embeddingStore = new InMemoryEmbeddingStore<>();
+        }
+        logger.info("Creating document parser and documet splitter...");
+        this.documentParser = new TextDocumentParser();
+            // Split document into segments 100 tokens each
+        this.splitter = DocumentSplitters.recursive(2000, 200);
+    }
+
+    private void watchWorkspace() {
         try {
-            logger.info("Initializing Vibe Coding Agent! Current folder={}", Paths.get("").toAbsolutePath());
+            sendResponse("DOCUMENT_LOAD", "Loading workspace...");
+            var unloadedFiles = loadProjectDocuments();
+            while(this.running.get()) {
+                if (!unloadedFiles.isEmpty()) {
+                    var file = unloadedFiles.poll();
+                    logger.info("Loading document... file={}", file);
+                    Document document = loadDocument(file, documentParser);
+                    document.metadata().put("filename", file.relativize(Paths.get(this.workspace)).toString());
+                    List<TextSegment> segments = splitter.split(document);
+                    logger.info("Loading documento into deepseek-coder model...");
+                    try {
+                        List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
+                        embeddingStore.addAll(embeddings, segments);
+                        logger.info("Document loaded... file={}", file);
+                        sendResponse("DOCUMENT_LOAD", String.format("File loaded! file=%s", Paths.get(workspace).relativize(file)));
 
-            AtomicBoolean running = new AtomicBoolean(true);
-            CountDownLatch latch = new CountDownLatch(1);
-            Runtime.getRuntime()
-                .addShutdownHook(new Thread() {
-                    @Override
-                    public void run() {
-                        logger.info("Shutdown signal received!!!");
-                        running.set(false);
-                        try {
-                            latch.await();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
+                        var workspaceData = getEmbeddingStorePath();
+                        embeddingStore.serializeToFile(workspaceData);
+                        logger.info("Saving embeddings to file {}", workspaceData);
+                    } catch (TimeoutException ex) {
+                        logger.info("Document loading timed out!", ex);
+                        unloadedFiles.add(file);
                     }
-                });
-            var model = OllamaChatModel.builder()
-                                       .baseUrl("http://localhost:11434")
-                                       .modelName("deepseek-coder")
-                                       .timeout(Duration.ofMinutes(5))
-                                       .build();
+                } else {
+                    unloadedFiles = loadProjectDocuments();
+                }
+            }
+        } catch (Exception ex) {
+            logger.error("Error on read request thread!", ex);
+        }
+        latch.countDown();
+    }
 
+    private Path getEmbeddingStorePath() {
+        var freeCodeWorkingDir = Paths.get(System.getProperty("user.home"), ".free-coding", Paths.get(this.workspace).getFileName().toString());
+        if (!freeCodeWorkingDir.toFile().exists()) {
+            freeCodeWorkingDir.toFile().mkdirs();
+        }
+        return freeCodeWorkingDir.resolve("store.json");
+    }
+
+    private Queue<Path> loadProjectDocuments() throws IOException {
+        return new LinkedList<>(Files.walk(Paths.get(this.workspace), 100)
+                                     .filter(file -> !file.toAbsolutePath().toString().contains(File.separator +"node_modules" + File.separator))
+                                     .filter(file -> !file.toAbsolutePath().toString().contains(File.separator + "target" + File.separator))
+                                     .filter(file -> file.toString().endsWith(".java") || file.toString().endsWith("pom.xml"))// || file.toString().endsWith(".js") || file.toString().endsWith(".ts"))
+                                     .toList());
+    }
+
+    @Override
+    public Integer call() throws Exception { // your business logic goes here...
+        try {
+            var currentFolder = Paths.get("").toAbsolutePath();
+            var threadPool = Executors.newFixedThreadPool(2);
+            Runtime.getRuntime()
+                   .addShutdownHook(new Thread() {
+                       @Override
+                       public void run() {
+                           logger.info("Shutdown signal received!!!");
+                           running.set(false);
+                           try {
+                               latch.await();
+                           } catch (InterruptedException e) {
+                               Thread.currentThread().interrupt();
+                           }
+                       }
+                   });
+            logger.info("Initializing Vibe Coding Agent! Current folder={}", currentFolder);
+            loadModel();
+            threadPool.submit(this::watchWorkspace);
+            threadPool.submit(this::readRequest);
+            this.latch.await();
+            return 0;
+        } catch (Exception ex) {
+            logger.error("Error!", ex);
+            return -1;
+        }
+    }
+
+    private void readRequest() {
+        try {
             // Set up non-blocking input channel
             var channel = Channels.newChannel(System.in);
             var buffer = ByteBuffer.allocate(BUFFER_SIZE);
             var inputBuffer = new StringBuilder();
             var currentOperation = new StringBuilder();
             String activeOperation = null;
-            
+
             logger.info("Process started!!! Reading input channel...");
             while (running.get()) {
                 int bytesRead = channel.read(buffer);
-                
+
                 if (bytesRead == -1) {
                     // End of stream
                     break;
@@ -99,7 +307,7 @@ public class server {
                             String[] parts = line.split(" ");
                             String operation = parts[0];
                             String action = parts[1];
-                            
+
                             if ("START".equals(action)) {
                                 if (activeOperation != null) {
                                     logger.warn("Nested operations not supported. Already in operation: {}", activeOperation);
@@ -115,7 +323,7 @@ public class server {
                                     logger.warn("END operation mismatch. Expected: {}, got: {}", activeOperation, operation);
                                 } else {
                                     logger.info("Operation {} ended", activeOperation);
-                                    handleOperation(activeOperation.trim(), currentOperation.toString().trim(), model);
+                                    handleOperation(activeOperation.trim(), currentOperation.toString().trim());
                                     activeOperation = null;
                                 }
                             }
@@ -128,64 +336,59 @@ public class server {
                     Thread.sleep(100);
                 }
             }
-
-            latch.countDown();
-            logger.info("Server shutdown!");
         } catch (Exception ex) {
-            logger.error("Error!", ex);
+            logger.error("Error on read request thread!", ex);
+        }
+        latch.countDown();
+    }
+
+    private String queryModel(String question) throws IOException {
+        var questionEmbedding = embeddingModel.embed(question).content();
+        var embeddingSearchRequest = EmbeddingSearchRequest.builder()
+                                                           .queryEmbedding(questionEmbedding)
+                                                           .maxResults(50)
+                                                           .minScore(0.7)
+                                                           .build();
+        var relevantEmbeddings = embeddingStore.search(embeddingSearchRequest).matches();
+        var promptTemplate = PromptTemplate.from(PROMPTS.get(language));
+
+        var information = relevantEmbeddings.stream()
+                                            .map(match -> match.embedded().text())
+                                            .collect(joining("\n\n"));
+        logger.info("Relevante information: {}", information);
+        Map<String, Object> variables = new HashMap<>();
+        variables.put("question", question);
+        variables.put("information", information);
+
+        try {
+            var prompt = promptTemplate.apply(variables);                
+            var aiMessage = ollamaModel.chat(prompt.toUserMessage()).aiMessage();
+            return aiMessage.text();
+        } catch (TimeoutException ex) {
+            logger.error("Chat timed out...", ex);
+            return "Timed out!";
         }
     }
-    
-    private static void handleOperation(String operation, String content, OllamaChatModel model) throws IOException {
+
+    private synchronized void sendResponse(String operation, String content) {
+        System.out.println(String.format("%s START\n%s\n%s END", operation, content, operation));
+    }
+
+    private void handleOperation(String operation, String content) throws IOException {
         logger.info("Operation '{}'", operation);
         switch (operation) {
             case "FREECODING_QUESTION":
                 logger.info("Processing FREECODING operation");
-                String answer = queryModel(model, content);
-                System.out.println("FREECODING_ANSWER START");
-                System.out.println(answer);
-                System.out.println("FREECODING_ANSWER END");
+                String answer = queryModel(content);
+                sendResponse("FREECODING_ANSWER", answer);
                 break;
-            case "SELECT_LANGUAGE": 
+            case "SELECT_LANGUAGE":
                 logger.info("Changing language to '{}'", content);
                 language = content;
                 break;
             default:
                 logger.warn("Unknown operation: {}", operation);
-                System.out.println(operation + "_ERROR START");
-                System.out.println("Unsupported operation: " + operation);
-                System.out.println(operation + "_ERROR END");
-        }
-    }
-    
-    private static String queryModel(OllamaChatModel model, String question) throws IOException {
-        return model.chat(PROMPTS.get(language).formatted(loadProjectCode(), question));
-    }
-
-    private static String loadProjectCode() throws IOException {
-        Path startPath = Paths.get(".", "src", "main", "java");
-        int maxDepth = 10;
-        long maxFileSize = 100_000; // 100KB
-        
-        try (Stream<Path> paths = Files.walk(startPath, maxDepth)) {
-            return paths
-                .filter(Files::isRegularFile)
-                .filter(p -> p.toString().endsWith(".java"))
-                .filter(p -> {
-                    try {
-                        return Files.size(p) <= maxFileSize;
-                    } catch (IOException e) {
-                        return false;
-                    }
-                })
-                .map(p -> {
-                    try {
-                        return "File: " + p + "\n" + Files.readString(p);
-                    } catch (IOException e) {
-                        return "Error reading: " + p;
-                    }
-                })
-                .collect(Collectors.joining("\n\n"));
+                sendResponse(operation + "_ERROR", "Unsupported operation: " + operation);
         }
     }
 }

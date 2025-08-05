@@ -5,6 +5,7 @@ export type Callback = (content: string) => void;
 export class FreeCodingChannel {
 	private _questionsListener: Callback | null;
 	private _answerListener: Callback | null;
+	private _eventListener: Map<string, Callback> = new Map<string, Callback>();
 	private _buffer: string[] = [];
 	private _defaultLanguage: string = 'pt-br';
 
@@ -27,6 +28,17 @@ export class FreeCodingChannel {
 
 	defaultLanguage(): string {
 		return this._defaultLanguage;
+	}
+
+	subscribe(eventType: string, listener: Callback) {
+		this._eventListener.set(eventType, listener);
+	}
+
+	event(eventType: string, content: string) {
+		let listener = this._eventListener.get(eventType);
+		if (listener) {
+			listener(content);
+		}
 	}
 
 	answer(content: string) {
@@ -86,6 +98,15 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 					return;
 			}
 		});
+
+		const webView = this._view.webview;
+		this._channel.subscribe('DOCUMENT_LOAD', content => webView.postMessage({
+			type: 'documentLoaded',
+			value: {
+				text: content,
+				timestamp: new Date().toLocaleTimeString()
+			}
+		}));
 	}
 
 	private _handleMessage(content: string) {
@@ -95,7 +116,7 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 		const webView = this._view.webview;
 		let message = JSON.parse(content) as FrontendMessage;
 		switch (message.type) {
-			case "sendMessage": {
+			case "sendMessage":
 				this._channel.listenAnswers(answer => webView.postMessage({
 					type: 'addMessage',
 					value: {
@@ -105,11 +126,14 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 					}
 				}));
 				this._channel.ask(message.data);
-			};
-			case "changeLanguage": {
+				break;
+			case "documentLoaded": 
+				console.log("Free Coding loaded document event!", message);
+				break;
+			case "changeLanguage":
 				console.log("Free Coding change language event!", message);
 				this._channel.changeLanguage(message.data);
-			}
+				break;
 		}
 	}
 
@@ -137,6 +161,7 @@ export class FreeCodingChatViewProvider implements vscode.WebviewViewProvider {
 			  	<select id="languageSelector">
 					<option value="pt-br" selected>Português (Brasil)</option>
 					<option value="en">English</option>
+					<option value="eS">Español</option>
 				</select>
 			  </div>
           </div>
@@ -178,39 +203,55 @@ function startJBangServer(context: vscode.ExtensionContext, channel: FreeCodingC
 	javaProcess.stdout?.on('data', (data) => {
 		var enc = new TextDecoder("utf-8");
 		var content = enc.decode(data);
-		console.log("[Free Coding] Raw answer received from backend...", content);
+		console.log("[Event Processing] Raw data received from backend...", content);
 
 		buffer += content;
 
-		// Process the buffer to find answers
+		// Process the buffer to find events
 		while (true) {
-			if (!isCapturing) {
-				const startIdx = buffer.indexOf('FREECODING_ANSWER START');
-				if (startIdx === -1) {
-					// No start marker found, discard everything
-					buffer = '';
-					break;
-				}
-
-				// Found start marker, begin capturing
-				isCapturing = true;
-				buffer = buffer.slice(startIdx + 'FREECODING_ANSWER START'.length);
-			} else {
-				const endIdx = buffer.indexOf('FREECODING_ANSWER END');
-				if (endIdx === -1) {
-					// No end marker yet, wait for more data
-					break;
-				}
-
-				// Found end marker, extract answer and send it
-				const answer = buffer.slice(0, endIdx).trim();
-				console.log("[Free Coding] Filtered answer received from backend...", answer);
-				channel.answer(answer);
-
-				// Reset state and process remaining buffer
-				isCapturing = false;
-				buffer = buffer.slice(endIdx + 'FREECODING_ANSWER END'.length);
+			// Find any event start pattern [A-Z_]+ START
+			const startMatch = buffer.match(/^([A-Z_]+) START/m);
+			if (!startMatch) {
+				// No start marker found in the entire buffer, discard everything
+				buffer = '';
+				break;
 			}
+
+			const eventName = startMatch[1];
+			const startMarker = `${eventName} START`;
+			const endMarker = `${eventName} END`;
+
+			const startIdx = buffer.indexOf(startMarker);
+			if (startIdx === -1) {
+				// Shouldn't happen since we matched the pattern, but just in case
+				buffer = '';
+				break;
+			}
+
+			// Check if we have the corresponding end marker
+			const remainingBuffer = buffer.slice(startIdx + startMarker.length);
+			const endIdx = remainingBuffer.indexOf(endMarker);
+
+			if (endIdx === -1) {
+				// No end marker yet, keep the buffer from the start marker onward
+				buffer = buffer.slice(startIdx);
+				break;
+			}
+
+			// Found complete event, extract content
+			const eventContent = remainingBuffer.slice(0, endIdx).trim();
+			console.log(`[Event Processing] Extracted content for ${eventName}:`, eventContent);
+			
+			// Handle the event based on eventName
+			if (eventName === 'FREECODING_ANSWER') {
+				channel.answer(eventContent);
+			} else {
+				channel.event(eventName, eventContent);
+			}
+			// Add other event handlers as needed
+
+			// Remove processed event from buffer and continue processing
+			buffer = remainingBuffer.slice(endIdx + endMarker.length);
 		}
 	});
 
@@ -240,7 +281,9 @@ export function activate(context: vscode.ExtensionContext) {
 	const channel = new FreeCodingChannel();
 	const provider = new FreeCodingChatViewProvider(context.extensionUri, channel);
 
-	context.subscriptions.push(vscode.window.registerWebviewViewProvider(FreeCodingChatViewProvider.viewType, provider));
+	context.subscriptions.push(vscode.window.registerWebviewViewProvider(FreeCodingChatViewProvider.viewType,
+		                                                                 provider, 
+		                                                                 { webviewOptions: { retainContextWhenHidden: true } }));
 	startJBangServer(context, channel);
 }
 

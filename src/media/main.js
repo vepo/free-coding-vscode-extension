@@ -6,6 +6,30 @@
   const messageInput = document.getElementById('messageInput');
   const sendButton = document.getElementById('sendButton');
   const languageSelector = document.getElementById('languageSelector');
+  let backendElement = null;
+  function addBackendMessage(content, timestamp) {
+    const messageElement = document.createElement('div');
+    messageElement.className = 'message backend-message';
+    
+    const messageContent = document.createElement('div');
+    messageContent.className = 'message-content';
+    messageContent.textContent = content;
+    
+    const messageMeta = document.createElement('div');
+    messageMeta.className = 'message-meta';
+    messageMeta.textContent = `${timestamp}`;
+    
+    messageElement.appendChild(messageContent);
+    messageElement.appendChild(messageMeta);
+    if (!backendElement) {
+      messagesContainer.appendChild(messageElement);
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    } else {
+      messagesContainer.replaceChild(messageElement, backendElement);
+      backendElement.remove();
+    }
+    backendElement = messageElement;
+  }
 
   function addMessage(text, isUser, timestamp) {
     const messageElement = document.createElement('div');
@@ -75,6 +99,9 @@
     switch (message.type) {
       case 'addMessage':
         addMessage(message.value.text, message.value.isUser, message.value.timestamp);
+        break;
+      case 'documentLoaded':
+        addBackendMessage(message.value.text, message.value.timestamp);
         break;
     }
   });
