@@ -7,7 +7,7 @@
 //DEPS dev.langchain4j:langchain4j-ollama:1.2.0
 //DEPS dev.langchain4j:langchain4j-easy-rag:1.2.0-beta8
 
-import static dev.langchain4j.data.document.loader.FileSystemDocumentLoader.loadDocuments;  
+import static dev.langchain4j.data.document.loader.FileSystemDocumentLoader.loadDocuments;
 import static dev.langchain4j.data.document.loader.FileSystemDocumentLoader.loadDocument;
 import static java.util.stream.Collectors.joining;
 
@@ -30,8 +30,10 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.Map;
+import java.util.ArrayList;
 
 import java.util.stream.Stream;
+import java.util.stream.Collectors;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.Executors;
@@ -54,11 +56,16 @@ import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentParser;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.parser.TextDocumentParser;
+import dev.langchain4j.data.document.splitter.DocumentByWordSplitter;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.document.splitter.HierarchicalDocumentSplitter;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.exception.TimeoutException;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.input.Prompt;
 import dev.langchain4j.model.input.PromptTemplate;
@@ -68,6 +75,99 @@ import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+
+class DocumentByJavaCodeSplitter extends HierarchicalDocumentSplitter {
+
+    private static final Pattern CLASS_PATTERN = Pattern.compile(
+        "(public|private|protected|)\\s*(class|interface|enum)\\s+\\w+.*?\\{(.*?)\\}\\s*",
+        Pattern.DOTALL);
+
+    private static final Pattern METHOD_PATTERN = Pattern.compile(
+        "(public|private|protected|static|final|native|synchronized|abstract|transient|volatile)+\\s+" +
+        "[\\w<>\\[\\]]+\\s+\\w+\\s*\\([^)]*\\)\\s*\\{(.*?)\\}\\s*",
+        Pattern.DOTALL);
+
+    private static final Pattern BLOCK_PATTERN = Pattern.compile(
+        "\\{(.*?)\\}\\s*",
+        Pattern.DOTALL);
+
+    public DocumentByJavaCodeSplitter(int maxSegmentSizeInChars,
+                                    int maxOverlapSizeInChars) {
+        super(maxSegmentSizeInChars, maxOverlapSizeInChars, null, null);
+    }
+
+    @Override
+    public String[] split(String text) {
+        List<String> segments = new ArrayList<>();
+
+        // First try to split by classes/interfaces/enums
+        Matcher classMatcher = CLASS_PATTERN.matcher(text);
+        while (classMatcher.find()) {
+            segments.add(classMatcher.group());
+        }
+
+        // If no classes found, try methods
+        if (segments.isEmpty()) {
+            Matcher methodMatcher = METHOD_PATTERN.matcher(text);
+            while (methodMatcher.find()) {
+                segments.add(methodMatcher.group());
+            }
+        }
+
+        // If no methods found, try code blocks
+        if (segments.isEmpty()) {
+            Matcher blockMatcher = BLOCK_PATTERN.matcher(text);
+            while (blockMatcher.find()) {
+                segments.add(blockMatcher.group());
+            }
+        }
+
+        // Fallback to splitting by lines if no blocks found
+        if (segments.isEmpty()) {
+            return text.split("\\r?\\n");
+        }
+
+        return segments.toArray(new String[0]);
+    }
+
+    @Override
+    public String joinDelimiter() {
+        return "\n\n"; // Use double newline to separate code segments
+    }
+
+    @Override
+    protected DocumentSplitter defaultSubSplitter() {
+        // Fall back to method-level splitting if needed
+        return new DocumentByJavaMethodSplitter(maxSegmentSize, maxOverlapSize);
+    }
+
+    /**
+     * Inner class for method-level splitting when needed
+     */
+    private static class DocumentByJavaMethodSplitter extends DocumentByJavaCodeSplitter {
+        DocumentByJavaMethodSplitter(int maxSegmentSize,
+                                   int maxOverlapSize) {
+            super(maxSegmentSize, maxOverlapSize);
+        }
+
+        @Override
+        public String[] split(String text) {
+            List<String> segments = new ArrayList<>();
+            Matcher methodMatcher = METHOD_PATTERN.matcher(text);
+            while (methodMatcher.find()) {
+                segments.add(methodMatcher.group());
+            }
+            return segments.toArray(new String[0]);
+        }
+
+
+        @Override
+        protected DocumentSplitter defaultSubSplitter() {
+            // Fall back to method-level splitting if needed
+            return new DocumentByWordSplitter(maxSegmentSize, maxOverlapSize);
+        }
+    }
+}
 
 
 @Command(name = "freecoding-server", mixinStandardHelpOptions = true, version = "Free Coding Server 0.1",
@@ -80,35 +180,35 @@ public class server implements Callable<Integer> {
 
     private static final Map<String, String> PROMPTS = Map.of("en", """
                                                                     Answer the following question, explaining your reasoning.
-                                                                    
+
                                                                     Also, develop 3 to 5 follow-up questions
                                                                     to this question.
-                                                                    
+
                                                                     Question:
                                                                     {{question}}
-                                                                    
+
                                                                     Base your answer on the following information:
                                                                     {{information}}
                                                                     """,
                                                               "pt-br", """
-                                                                       Responda a pergunta a seguir, explicitando o embasameno da resposta. 
-                                                                       Também elabore de 3 a 5 perguntas que podem ser feitas em sequeência 
+                                                                       Responda a pergunta a seguir, explicitando o embasameno da resposta.
+                                                                       Também elabore de 3 a 5 perguntas que podem ser feitas em sequeência
                                                                        a essa pergunta.
-                                                                       
+
                                                                        Pergunta:
                                                                        {{question}}
-                                                                       
+
                                                                        Baseie sua resposta na seguinte informação:
                                                                        {{information}}
                                                                        """,
                                                               "es", """
                                                                     Responda la siguiente pregunta, explicando su razonamiento.
-                                                                    
+
                                                                     Además, desarrolle de 3 a 5 preguntas complementarias a esta pregunta.
-                                                                    
+
                                                                     Pregunta:
                                                                     {{pregunta}}
-                                                                    
+
                                                                     Base su respuesta en la siguiente información:
                                                                     {{información}}
                                                                     """);
@@ -166,7 +266,8 @@ public class server implements Callable<Integer> {
     private InMemoryEmbeddingStore<TextSegment> embeddingStore;
     private DocumentParser documentParser;
     private DocumentSplitter splitter;
-    private static String language = "pt-br";
+    private String language = "pt-br";
+    private ChatMemory memory = MessageWindowChatMemory.withMaxMessages(100);
 
     private void loadModel() {
         this.ollamaModel = OllamaChatModel.builder()
@@ -191,7 +292,7 @@ public class server implements Callable<Integer> {
         logger.info("Creating document parser and documet splitter...");
         this.documentParser = new TextDocumentParser();
             // Split document into segments 100 tokens each
-        this.splitter = DocumentSplitters.recursive(2000, 200);
+        this.splitter = new DocumentByJavaCodeSplitter(2000, 200);
     }
 
     private void watchWorkspace() {
@@ -203,7 +304,7 @@ public class server implements Callable<Integer> {
                     var file = unloadedFiles.poll();
                     logger.info("Loading document... file={}", file);
                     Document document = loadDocument(file, documentParser);
-                    document.metadata().put("filename", file.relativize(Paths.get(this.workspace)).toString());
+                    document.metadata().put("filename", Paths.get(this.workspace).relativize(file).toString());
                     List<TextSegment> segments = splitter.split(document);
                     logger.info("Loading documento into deepseek-coder model...");
                     try {
@@ -230,7 +331,7 @@ public class server implements Callable<Integer> {
     }
 
     private Path getEmbeddingStorePath() {
-        var freeCodeWorkingDir = Paths.get(System.getProperty("user.home"), ".free-coding", Paths.get(this.workspace).getFileName().toString());
+        var freeCodeWorkingDir = Paths.get(System.getProperty("user.home"), ".free-coding", Paths.get(this.workspace).toAbsolutePath().getFileName().toString());
         if (!freeCodeWorkingDir.toFile().exists()) {
             freeCodeWorkingDir.toFile().mkdirs();
         }
@@ -346,7 +447,7 @@ public class server implements Callable<Integer> {
         var questionEmbedding = embeddingModel.embed(question).content();
         var embeddingSearchRequest = EmbeddingSearchRequest.builder()
                                                            .queryEmbedding(questionEmbedding)
-                                                           .maxResults(50)
+                                                           .maxResults(3)
                                                            .minScore(0.7)
                                                            .build();
         var relevantEmbeddings = embeddingStore.search(embeddingSearchRequest).matches();
@@ -360,9 +461,16 @@ public class server implements Callable<Integer> {
         variables.put("question", question);
         variables.put("information", information);
 
+        if (memory.messages().isEmpty()) {
+            memory.add(SystemMessage.from("""
+                    Este é o código do projeto
+                    """.formatted(loadProjectCodePrompt())));
+        }
+
         try {
-            var prompt = promptTemplate.apply(variables);                
-            var aiMessage = ollamaModel.chat(prompt.toUserMessage()).aiMessage();
+            var prompt = promptTemplate.apply(variables);
+            this.memory.add(prompt.toUserMessage());
+            var aiMessage = ollamaModel.chat(memory.messages()).aiMessage();
             return aiMessage.text();
         } catch (TimeoutException ex) {
             logger.error("Chat timed out...", ex);
@@ -389,6 +497,38 @@ public class server implements Callable<Integer> {
             default:
                 logger.warn("Unknown operation: {}", operation);
                 sendResponse(operation + "_ERROR", "Unsupported operation: " + operation);
+        }
+    }
+
+    private static String loadProjectCodePrompt() throws IOException {
+        Path startPath = Paths.get(".", "src", "main", "java");
+        int maxDepth = 10;
+        long maxFileSize = 100_000; // 100KB
+        
+        try (Stream<Path> paths = Files.walk(startPath, maxDepth)) {
+            return paths
+                .filter(Files::isRegularFile)
+                .filter(p -> p.toString().endsWith(".java"))
+                .filter(p -> {
+                    try {
+                        return Files.size(p) <= maxFileSize;
+                    } catch (IOException e) {
+                        return false;
+                    }
+                })
+                .map(p -> {
+                    try {
+                        return """
+                                Arquivo: %s
+                                ---
+                                %s
+                                ---
+                                """.formatted(p, Files.readString(p));
+                    } catch (IOException e) {
+                        return "Error reading: " + p;
+                    }
+                })
+                .collect(Collectors.joining("\n\n"));
         }
     }
 }
