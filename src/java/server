@@ -471,6 +471,7 @@ public class server implements Callable<Integer> {
             var prompt = promptTemplate.apply(variables);
             this.memory.add(prompt.toUserMessage());
             var aiMessage = ollamaModel.chat(memory.messages()).aiMessage();
+            memory.add(aiMessage);
             return aiMessage.text();
         } catch (TimeoutException ex) {
             logger.error("Chat timed out...", ex);
