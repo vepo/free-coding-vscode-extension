@@ -1,6 +1,6 @@
 
 (function () {
-  console.log("Starting chat....")
+  console.log("Starting chat....");
   const vscode = acquireVsCodeApi();
   const messagesContainer = document.getElementById('messages');
   const messageInput = document.getElementById('messageInput');
